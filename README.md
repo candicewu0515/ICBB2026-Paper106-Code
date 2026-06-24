@@ -4,6 +4,8 @@ This repository contains the analysis workflow accompanying ICBB 2026 Paper 106:
 
 **LASSO-Based Gene Signature Identification for Colorectal Cancer Classification Using TCGA Expression Data**
 
+Repository URL: https://github.com/candicewu0515/ICBB2026-Paper106-Code
+
 ## Overview
 
 The workflow reproduces the main bioinformatics and machine-learning analysis:
@@ -56,4 +58,3 @@ results/
 ## Notes
 
 The analysis was originally developed as a course/project workflow and was reorganized for conference-paper reproducibility. The paper reports the sample split used in the original analysis: 143 tumor samples and 186 adjacent normal samples, with 20,530 genes.
-
