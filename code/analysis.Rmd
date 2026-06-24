@@ -1,0 +1,205 @@
+---
+title: "Reproducible Analysis for ICBB 2026 Paper 106"
+author: "Xia Wu"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+dir.create("results", showWarnings = FALSE)
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Packages
+
+```{r packages}
+required_packages <- c(
+  "readr", "dplyr", "limma", "FactoMineR", "ggplot2", "ggpubr",
+  "glmnet", "stringr", "ROCR", "patchwork", "tibble"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop("Install missing packages before running: ", paste(missing_packages, collapse = ", "))
+}
+
+library(readr)
+library(dplyr)
+library(limma)
+library(FactoMineR)
+library(ggplot2)
+library(ggpubr)
+library(glmnet)
+library(stringr)
+library(ROCR)
+library(patchwork)
+library(tibble)
+```
+
+## Data Input
+
+```{r data-input}
+expression_file <- file.path("data", "raw", "HiSeqV2")
+clinical_file <- file.path("data", "raw", "TCGA.COAD.sampleMap_COAD_clinicalMatrix")
+
+if (!file.exists(expression_file)) {
+  stop("Missing expression file: ", expression_file)
+}
+if (!file.exists(clinical_file)) {
+  stop("Missing clinical file: ", clinical_file)
+}
+
+raw_data <- read_tsv(expression_file, show_col_types = FALSE)
+clinical_data <- read_tsv(clinical_file, show_col_types = FALSE)
+
+gene_ids <- raw_data$sample
+expression_matrix <- as.data.frame(as.matrix(raw_data[, -1]))
+rownames(expression_matrix) <- gene_ids
+```
+
+## Preprocessing
+
+The original workflow classified samples by TCGA barcode prefixes available in the expression matrix. Tumor and normal groups are retained in the same order used for the conference-paper analysis.
+
+```{r preprocessing}
+tumor_columns <- grep("TCGA-A", colnames(expression_matrix), value = TRUE)
+tumor_expression <- expression_matrix[, tumor_columns]
+normal_expression <- expression_matrix[, setdiff(colnames(expression_matrix), tumor_columns)]
+
+stopifnot(ncol(tumor_expression) == 143)
+stopifnot(ncol(normal_expression) == 186)
+
+analysis_matrix <- cbind(tumor_expression, normal_expression)
+group <- factor(c(rep("tumor", ncol(tumor_expression)), rep("normal", ncol(normal_expression))),
+                levels = c("normal", "tumor"))
+
+dim(analysis_matrix)
+table(group)
+```
+
+## Differential Expression Analysis
+
+```{r differential-expression}
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+contrast_matrix <- makeContrasts(tumor - normal, levels = design)
+
+fit <- lmFit(analysis_matrix, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+all_diff <- topTable(fit2, coef = 1, number = Inf)
+all_diff$gene <- rownames(all_diff)
+all_diff <- all_diff %>%
+  mutate(change = case_when(
+    P.Value < 0.05 & logFC > 2 ~ "Up",
+    P.Value < 0.05 & logFC < -2 ~ "Down",
+    TRUE ~ "Stable"
+  ))
+
+write.table(all_diff, file = "results/limma_all_genes.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+
+deg <- all_diff %>% filter(change != "Stable")
+write.table(deg, file = "results/differentially_expressed_genes.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+
+table(deg$change)
+```
+
+```{r volcano, fig.width=7, fig.height=5}
+volcano_plot <- ggplot(all_diff, aes(x = logFC, y = -log10(adj.P.Val), colour = change)) +
+  geom_point(alpha = 0.45, size = 2.2) +
+  scale_color_manual(values = c(Down = "#546de5", Stable = "#d2dae2", Up = "#ff4757")) +
+  labs(x = "log2 fold change", y = "-log10 adjusted p-value") +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggsave("results/figures/volcano_plot.png", volcano_plot, width = 7, height = 5, dpi = 300)
+volcano_plot
+```
+
+## PCA
+
+```{r pca}
+pca_all <- PCA(as.data.frame(t(analysis_matrix)), scale.unit = TRUE, ncp = 2, graph = FALSE)
+deg_expression <- analysis_matrix[rownames(analysis_matrix) %in% deg$gene, ]
+pca_deg <- PCA(as.data.frame(t(deg_expression)), scale.unit = TRUE, ncp = 2, graph = FALSE)
+
+pca_all$eig[1:2, ]
+pca_deg$eig[1:2, ]
+```
+
+```{r pca-plot, fig.width=8, fig.height=4}
+pca_scores <- as.data.frame(pca_deg$ind$coord[, 1:2])
+pca_scores$group <- group
+
+pca_plot <- ggplot(pca_scores, aes(x = Dim.1, y = Dim.2, color = group)) +
+  geom_point(size = 2, alpha = 0.75) +
+  stat_ellipse(type = "norm", linewidth = 0.6) +
+  theme_bw() +
+  labs(x = "PC1", y = "PC2", color = "")
+
+ggsave("results/figures/pca_deg.png", pca_plot, width = 8, height = 4, dpi = 300)
+pca_plot
+```
+
+## LASSO Logistic Regression
+
+```{r lasso}
+set.seed(106)
+x <- t(deg_expression)
+y <- ifelse(group == "tumor", 1, 0)
+
+cv_fit <- cv.glmnet(x = x, y = y, family = "binomial", nlambda = 1000, alpha = 1)
+
+model_lasso_min <- glmnet(x = x, y = y, family = "binomial", alpha = 1, lambda = cv_fit$lambda.min)
+model_lasso_1se <- glmnet(x = x, y = y, family = "binomial", alpha = 1, lambda = cv_fit$lambda.1se)
+
+coef_min <- coef(model_lasso_min)
+coef_1se <- coef(model_lasso_1se)
+
+selected_min <- rownames(coef_min)[as.numeric(coef_min) != 0]
+selected_1se <- rownames(coef_1se)[as.numeric(coef_1se) != 0]
+selected_min <- setdiff(selected_min, "(Intercept)")
+selected_1se <- setdiff(selected_1se, "(Intercept)")
+
+selected_genes <- tibble(
+  model = c("lambda_minimum", "lambda_1se"),
+  selected_genes = c(paste(selected_min, collapse = ", "), paste(selected_1se, collapse = ", ")),
+  n_genes = c(length(selected_min), length(selected_1se))
+)
+
+write.table(selected_genes, file = "results/lasso_selected_genes.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+selected_genes
+```
+
+```{r lasso-roc, fig.width=6, fig.height=5}
+probabilities <- predict(cv_fit, newx = x, s = c(cv_fit$lambda.min, cv_fit$lambda.1se), type = "response")
+prediction_table <- data.frame(
+  event = y,
+  prob_min = probabilities[, 1],
+  prob_1se = probabilities[, 2]
+)
+
+pred_min <- prediction(prediction_table$prob_min, prediction_table$event)
+pred_1se <- prediction(prediction_table$prob_1se, prediction_table$event)
+auc_min <- performance(pred_min, "auc")@y.values[[1]]
+auc_1se <- performance(pred_1se, "auc")@y.values[[1]]
+perf_min <- performance(pred_min, "tpr", "fpr")
+perf_1se <- performance(pred_1se, "tpr", "fpr")
+
+png("results/figures/roc_curves.png", width = 1800, height = 1500, res = 300)
+plot(perf_min, colorize = FALSE, col = "blue", main = "ROC Curves for LASSO Models")
+plot(perf_1se, colorize = FALSE, col = "red", add = TRUE)
+lines(c(0, 1), c(0, 1), col = "gray", lty = 4)
+legend("bottomright",
+       legend = c(paste0("lambda-minimum AUC = ", round(auc_min, 3)),
+                  paste0("lambda-1se AUC = ", round(auc_1se, 3))),
+       col = c("blue", "red"), lwd = 2, bty = "n")
+dev.off()
+
+c(auc_min = auc_min, auc_1se = auc_1se)
+```
+

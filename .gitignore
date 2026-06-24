@@ -1,0 +1,12 @@
+data/raw/*
+!data/raw/.gitkeep
+results/*
+!results/.gitkeep
+!results/figures/
+!results/figures/.gitkeep
+.Rhistory
+.RData
+.Rproj.user/
+*.html
+*.pdf
+
